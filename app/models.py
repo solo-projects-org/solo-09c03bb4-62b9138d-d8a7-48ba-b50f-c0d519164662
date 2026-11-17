@@ -97,3 +97,83 @@ class RebuildOut(BaseModel):
     rebuilt_devices: list[str]
     failed_devices: dict[str, str]
     detail: str | None = None
+
+
+class ReconciliationIn(BaseModel):
+    total_device_id: str = Field(min_length=1, description="总表设备号")
+    sub_device_ids: list[str] = Field(min_length=1, description="分表设备号（至少一台）")
+    start_ts: datetime = Field(description="对账区间起（UTC，闭区间）")
+    end_ts: datetime = Field(description="对账区间止（UTC，闭区间）")
+    tolerance_kwh: float = Field(ge=0, description="允许差额 kWh（非负）")
+
+    @field_validator("start_ts", "end_ts")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError(
+                "timestamp must include a timezone (use UTC, e.g. 2026-01-01T00:00:00Z)"
+            )
+        return v
+
+    @field_validator("total_device_id")
+    @classmethod
+    def _strip_total(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+    @field_validator("sub_device_ids")
+    @classmethod
+    def _clean_subs(cls, v: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in v:
+            item = raw.strip()
+            if not item:
+                raise ValueError("sub_device_ids must not contain blank values")
+            if item not in cleaned:
+                cleaned.append(item)
+        if not cleaned:
+            raise ValueError("sub_device_ids must contain at least one device")
+        return cleaned
+
+
+class ReconciliationSegmentOut(BaseModel):
+    start_ts: str = Field(description="分段起点（总表读数时刻，UTC）")
+    end_ts: str = Field(description="分段终点（总表读数时刻，UTC）")
+    total_kwh: float = Field(description="本段总表电量")
+    sub_kwh: float = Field(description="本段各分表电量合计")
+    difference_kwh: float = Field(description="总表减分表合计")
+    exceeded: bool = Field(description="|difference_kwh| 是否超过允许差额")
+    total_readings: list[dict] = Field(description="总表本段两端读数及来源编号/修订号")
+    sub_readings: list[dict] = Field(description="各分表本段两端读数、设备号及来源编号/修订号")
+    total_handover: dict | None = Field(description="总表本段使用的换表交接（无则为 null）")
+    sub_handovers: list[dict] = Field(description="各分表本段使用的换表交接")
+
+
+class ReconciliationOut(BaseModel):
+    id: int
+    status: str = Field(description="published | blocked | superseded")
+    total_device_id: str
+    sub_device_ids: list[str]
+    start_ts: str
+    end_ts: str
+    tolerance_kwh: float
+    fingerprint: str
+    version: int | None
+    segments: list[ReconciliationSegmentOut] | None = Field(
+        description="逐段结论；未发布（blocked/superseded-without-segments）时为 null，绝不返回部分结论"
+    )
+    exceeded: bool | None = Field(description="任一段超限即为 true；未发布时为 null")
+    blocked_devices: list[str] = Field(description="受阻设备（含总表与分表）")
+    blocked_details: list[dict] = Field(
+        default_factory=list, description="受阻明细（设备、原因、涉及分段）"
+    )
+    detail: str | None
+    created_at: str | None
+    superseded_at: str | None
+    superseded_reason: str | None
+
+
+class ReconciliationListOut(BaseModel):
+    items: list[ReconciliationOut]

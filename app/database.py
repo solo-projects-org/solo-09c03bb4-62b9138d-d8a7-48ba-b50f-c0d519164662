@@ -1,9 +1,13 @@
 """SQLite connection management and schema definition.
 
-FastAPI runs sync endpoints in a worker thread, while the lifespan runs in the
-main thread, so connections are thread-local (all pointing at the same file).
-WAL permits concurrent readers; writers serialize via ``BEGIN IMMEDIATE`` and
-the busy timeout.
+FastAPI may schedule a sync dependency and the sync endpoint it feeds on
+different worker threads, so thread-local connections are NOT safe: one
+connection could be used concurrently by two threads, which SQLite rejects
+("cannot start a transaction within a transaction").  Instead the pool hands
+out a connection per request and takes it back when the request ends, so a
+connection is only ever owned by one thread at a time.  WAL permits
+concurrent readers; writers serialize via ``BEGIN IMMEDIATE`` and the busy
+timeout.
 """
 from __future__ import annotations
 
@@ -90,6 +94,45 @@ CREATE TABLE IF NOT EXISTS rebuild_runs (
     started_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     finished_at TEXT
 );
+
+-- Reconciliation conclusions between one total meter device and several
+-- sub-meter devices over a closed UTC window.  A row is one immutable
+-- evaluation ('published' when every segment could be stated, 'blocked'
+-- otherwise).  A later accepted reading/handover correction on any
+-- participating device flips it to 'superseded' in the same transaction;
+-- superseded rows stay queryable for audit and can never become current again.
+CREATE TABLE IF NOT EXISTS reconciliations (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    total_device_id   TEXT    NOT NULL,
+    sub_device_ids    TEXT    NOT NULL,       -- canonical JSON array
+    start_ts          TEXT    NOT NULL,
+    end_ts            TEXT    NOT NULL,
+    tolerance_kwh     REAL    NOT NULL CHECK (tolerance_kwh >= 0),
+    fingerprint       TEXT    NOT NULL,
+    version           INTEGER NOT NULL CHECK (version >= 1),
+    status            TEXT    NOT NULL CHECK (status IN ('published','blocked','superseded')),
+    segments          TEXT,                   -- JSON; NULL unless published
+    blocked_devices   TEXT,                   -- JSON array; empty unless blocked
+    exceeded          INTEGER,                -- 1/0 when published, NULL when blocked
+    detail            TEXT,
+    created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    superseded_at     TEXT,
+    superseded_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliations_fingerprint
+    ON reconciliations(fingerprint, version);
+CREATE INDEX IF NOT EXISTS idx_reconciliations_status ON reconciliations(status);
+
+-- Which devices a conclusion depends on (total and each sub), indexed so an
+-- accepted correction can revoke exactly the affected conclusions.
+CREATE TABLE IF NOT EXISTS reconciliation_devices (
+    reconciliation_id INTEGER NOT NULL REFERENCES reconciliations(id),
+    device_id         TEXT    NOT NULL,
+    role              TEXT    NOT NULL CHECK (role IN ('total','sub')),
+    PRIMARY KEY (reconciliation_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_devices_device
+    ON reconciliation_devices(device_id);
 """
 
 
@@ -98,6 +141,11 @@ def _open_one(db_path: str) -> sqlite3.Connection:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Transactions are managed explicitly with BEGIN IMMEDIATE below.  Leaving
+    # sqlite3's implicit-transaction mode on makes DML open a transaction
+    # behind our back, which under concurrent requests leads to
+    # "cannot start a transaction within a transaction".
+    conn.isolation_level = None
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
@@ -105,31 +153,49 @@ def _open_one(db_path: str) -> sqlite3.Connection:
 
 
 class ConnectionPool:
-    """One SQLite connection per thread, all backed by the same file."""
+    """Hands out one connection per request; all back the same SQLite file."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._local = threading.local()
-        self._conns: list[sqlite3.Connection] = []
+        self._idle: list[sqlite3.Connection] = []
+        self._all: list[sqlite3.Connection] = []
         self._lock = threading.Lock()
 
-    def get(self) -> sqlite3.Connection:
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
+    def acquire(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._idle:
+                return self._idle.pop()
             conn = _open_one(self.db_path)
-            self._local.conn = conn
-            with self._lock:
-                self._conns.append(conn)
-        return conn
+            self._all.append(conn)
+            return conn
+
+    def release(self, conn: sqlite3.Connection) -> None:
+        # Never return a connection that still holds an open transaction or
+        # an uncommitted write: roll it back so the next borrower starts clean.
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except sqlite3.Error:
+            pass
+        with self._lock:
+            self._idle.append(conn)
 
     def init_schema(self) -> None:
-        init_db(self.get())
+        conn = self.acquire()
+        try:
+            init_db(conn)
+        finally:
+            self.release(conn)
 
     def close(self) -> None:
         with self._lock:
-            for conn in self._conns:
-                conn.close()
-            self._conns.clear()
+            for conn in self._all:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._all.clear()
+            self._idle.clear()
 
 
 def init_db(conn: sqlite3.Connection) -> None:

@@ -16,3 +16,11 @@ class RebuildFailure(Exception):
         self.device_id = device_id
         self.reason = reason
         super().__init__(f"rebuild failed for device {device_id}: {reason}")
+
+
+class NotFoundError(Exception):
+    """404: the requested object does not exist."""
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
